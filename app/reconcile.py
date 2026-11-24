@@ -58,6 +58,23 @@ def frontier(
     return list(dict.fromkeys(used)), list(dict.fromkeys(missing))
 
 
+def _matches_existing(row: sqlite3.Row, *, used_ids: list[str], used_readings: list[dict[str, Any]], missing_ids: list[str], own_amount: int, sum_used: int, is_complete: bool, difference: int | None) -> bool:
+    """Compare freshly derived conclusion content with a stored row."""
+    if int(row["own_amount"]) != own_amount:
+        return False
+    if int(row["sum_used"]) != sum_used:
+        return False
+    if bool(row["is_complete"]) != is_complete:
+        return False
+    if row["difference"] != difference:
+        return False
+    return (
+        json.loads(row["used_meter_ids"]) == used_ids
+        and json.loads(row["used_readings_json"]) == used_readings
+        and json.loads(row["missing_meter_ids"]) == missing_ids
+    )
+
+
 def recompute_one(
     conn: sqlite3.Connection,
     meter_id: str,
@@ -65,11 +82,17 @@ def recompute_one(
     *,
     children: dict[str, list[str]] | None = None,
     readings: dict[str, int] | None = None,
+    skip_unchanged: bool = False,
 ) -> dict[str, Any] | None:
     """Recompute and atomically upsert/delete one stored conclusion.
 
     Returns None when the meter is not eligible (no current own report or no
     children). Any stale conclusion for an ineligible meter is removed.
+
+    With ``skip_unchanged`` a conclusion whose derived content equals the
+    stored row is left completely untouched, preserving its ``version`` and
+    ``computed_at``. Registration uses this so adding a branch below a meter
+    whose report already covers that whole branch does not churn ancestors.
     """
     meter = conn.execute("SELECT meter_id FROM meters WHERE meter_id = ?", (meter_id,)).fetchone()
     if meter is None:
@@ -109,6 +132,23 @@ def recompute_one(
     is_complete = not missing_ids
     own_amount = int(own["amount"])
     difference = own_amount - sum_used if is_complete else None
+
+    if skip_unchanged:
+        existing = conn.execute(
+            "SELECT * FROM reconciliations WHERE hour = ? AND meter_id = ?",
+            (hour, meter_id),
+        ).fetchone()
+        if existing is not None and _matches_existing(
+            existing,
+            used_ids=used_ids,
+            used_readings=used_readings,
+            missing_ids=missing_ids,
+            own_amount=own_amount,
+            sum_used=sum_used,
+            is_complete=is_complete,
+            difference=difference,
+        ):
+            return serialize_conclusion(existing)
 
     conn.execute(
         """

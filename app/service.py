@@ -34,6 +34,80 @@ def _self_and_ancestors(conn: sqlite3.Connection, meter_id: str) -> list[str]:
     return chain
 
 
+def _recompute_added_meter_ancestors(
+    conn: sqlite3.Connection, added_ids: list[str]
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Refresh stored conclusions touched by appending meters to the tree.
+
+    Adding a meter can only change the report frontier of its ancestors, so
+    only those ancestors are checked and only for the hours in which each one
+    has its own current report. Side branches are never rewritten.
+
+    Conclusions whose derived content is unchanged (for example an ancestor
+    already covered by an intermediate meter's report) keep their stored
+    version and computed_at; they are not reported as recomputed.
+    """
+    if not added_ids:
+        return [], [], []
+
+    parents = _parent_map(conn)
+    affected: list[str] = []
+    seen: set[str] = set()
+    for added_id in added_ids:
+        current = parents.get(added_id)
+        while current is not None and current not in seen:
+            seen.add(current)
+            affected.append(current)
+            current = parents.get(current)
+
+    children, _ = load_tree(conn)
+    readings_by_hour: dict[str, dict[str, int]] = {}
+    conclusions: list[dict[str, Any]] = []
+    changed: list[str] = []
+    preserved: list[str] = []
+    for meter_id in affected:
+        hours = [
+            row["hour"]
+            for row in conn.execute(
+                "SELECT DISTINCT hour FROM readings WHERE meter_id = ? ORDER BY hour",
+                (meter_id,),
+            )
+        ]
+        for hour in hours:
+            readings = readings_by_hour.get(hour)
+            if readings is None:
+                readings = readings_by_hour[hour] = load_readings(conn, hour)
+            previous = conn.execute(
+                "SELECT * FROM reconciliations WHERE hour = ? AND meter_id = ?",
+                (hour, meter_id),
+            ).fetchone()
+            conclusion = recompute_one(
+                conn,
+                meter_id,
+                hour,
+                children=children,
+                readings=readings,
+                skip_unchanged=True,
+            )
+            if conclusion is None:
+                # A stored conclusion removed because the meter is no longer
+                # eligible is also a change to this meter's ledger state.
+                if previous is not None and meter_id not in changed:
+                    changed.append(meter_id)
+                continue
+            if previous is not None and int(previous["version"]) == int(conclusion["version"]):
+                # Same content: keep (and report) the untouched stored row.
+                conclusions.append(conclusion)
+                if meter_id not in preserved:
+                    preserved.append(meter_id)
+                continue
+            conclusions.append(conclusion)
+            if meter_id not in changed:
+                changed.append(meter_id)
+    preserved = [meter_id for meter_id in preserved if meter_id not in changed]
+    return conclusions, changed, preserved
+
+
 def register_meters(payload: Any, *, replace: bool = False) -> dict[str, Any]:
     meters = flatten_meter_payload(payload)
     payload_ids = [item["meter_id"] for item in meters]
@@ -50,6 +124,7 @@ def register_meters(payload: Any, *, replace: bool = False) -> dict[str, Any]:
         existing_rows = conn.execute("SELECT meter_id, parent_id FROM meters").fetchall()
         existing = {row["meter_id"]: row["parent_id"] for row in existing_rows}
         all_parents = dict(existing)
+        added_ids: list[str] = []
 
         for item in meters:
             mid = item["meter_id"]
@@ -68,7 +143,14 @@ def register_meters(payload: Any, *, replace: bool = False) -> dict[str, Any]:
                     f"Meter {mid!r} is fixed with parent {existing[mid]!r}; parent cannot change.",
                     {"meter_id": mid, "existing_parent_id": existing[mid], "requested_parent_id": parent},
                 )
-            all_parents[mid] = parent
+            if mid in existing and not item["parent_specified"]:
+                # The stored tree is fixed: a re-registration without an
+                # explicit parent keeps the existing relationship.
+                all_parents[mid] = existing[mid]
+            else:
+                all_parents[mid] = parent
+            if mid not in existing:
+                added_ids.append(mid)
 
         # Cycle detection over the combined graph.
         for start in all_parents:
@@ -102,7 +184,20 @@ def register_meters(payload: Any, *, replace: bool = False) -> dict[str, Any]:
                 ),
             )
 
-    return list_meters_tree()
+        # Appending branches can change an ancestor's report frontier and can
+        # turn a former leaf into a parent. Refresh those conclusions in the
+        # same transaction as the new meter rows.
+        updated_conclusions, changed_ids, preserved_ids = _recompute_added_meter_ancestors(
+            conn, added_ids
+        )
+
+    result = list_meters_tree()
+    result["added_meter_ids"] = added_ids
+    result["recomputed_meter_ids"] = changed_ids
+    result["preserved_meter_ids"] = preserved_ids
+    result["reconciliations"] = updated_conclusions
+    result["conclusions"] = updated_conclusions
+    return result
 
 
 def list_meters() -> list[dict[str, Any]]:
